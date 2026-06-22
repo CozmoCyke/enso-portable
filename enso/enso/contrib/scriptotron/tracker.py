@@ -1,352 +1,406 @@
 import logging
 import os
-import types
-
+import threading
+import tokenize
 import traceback
+import types
 
 from enso import config
 from enso.commands.manager import CommandAlreadyRegisteredError
-from enso.contrib.scriptotron.tracebacks import TracebackCommand
-from enso.contrib.scriptotron.tracebacks import safetyNetted
-from enso.contrib.scriptotron.events import EventResponderList
 from enso.contrib.scriptotron import adapters
 from enso.contrib.scriptotron import cmdretriever
-from enso.contrib.scriptotron import ensoapi
 from enso.contrib.scriptotron import concurrency
+from enso.contrib.scriptotron import ensoapi
+from enso.contrib.scriptotron.tracebacks import TracebackCommand
+from enso.contrib.scriptotron.tracebacks import safetyNetted
 
 
-class ScriptCommandTracker:
-    def __init__( self, commandManager, eventManager ):
-        self._cmdExprs = []
-        self._cmdExprsByFile = {}
-        self._qmStartEventsByFile = {}
-        self._cmdMgr = commandManager
-        self._genMgr = concurrency.GeneratorManager( eventManager )
-        self._qmStartEvents = EventResponderList(
-            eventManager,
-            "startQuasimode",
-            self._onQuasimodeStart
-            )
-
-    @safetyNetted
-    def _callHandler( self, handler ):
-        result = handler()
-        if isinstance( result, types.GeneratorType ):
-            self._genMgr.add( result )
-
-    def _onQuasimodeStart( self ):
-        for handler in self._qmStartEvents:
-            self._callHandler( handler )
-
-    def _removeQuasimodeHandlers( self, handlers ):
-        handlers = list( handlers )
-        remainingHandlers = []
-
-        for currentHandler in self._qmStartEvents:
-            for index, handler in enumerate( handlers ):
-                if currentHandler is handler:
-                    del handlers[index]
-                    break
-            else:
-                remainingHandlers.append( currentHandler )
-
-        self._qmStartEvents[:] = remainingHandlers
-
-    def clearCommands( self, commandFile = None ):
-        if commandFile is None:
-            cmdExprs = list( self._cmdExprs )
-            self._cmdExprsByFile = {}
-            self._qmStartEventsByFile = {}
-            self._qmStartEvents[:] = []
-        else:
-            cmdExprs = self._cmdExprsByFile.pop( commandFile, [] )
-            handlers = self._qmStartEventsByFile.pop( commandFile, [] )
-            self._removeQuasimodeHandlers( handlers )
-
-        for cmdExpr in cmdExprs:
-            self._cmdMgr.unregisterCommand( cmdExpr )
-
-        if commandFile is None:
-            self._cmdExprs = []
-        else:
-            self._cmdExprs = [
-                cmdExpr for cmdExpr in self._cmdExprs
-                if cmdExpr not in cmdExprs
-                ]
-
-        # A generator may still reference globals from the previous version of
-        # a script.  Resetting generators is cheap and avoids running stale
-        # code while leaving commands from unchanged files registered.
-        self._genMgr.reset()
-
-    def _registerCommand( self, cmdObj, cmdExpr, commandFile = None ):
-        try:
-            self._cmdMgr.registerCommand( cmdExpr, cmdObj )
-            self._cmdExprs.append( cmdExpr )
-            if commandFile is not None:
-                self._cmdExprsByFile.setdefault( commandFile, [] ).append(
-                    cmdExpr
-                    )
-        except CommandAlreadyRegisteredError:
-            logging.warning( "Command already registered: %s" % cmdExpr )
-
-    def registerNewCommands( self, commandInfoList, commandFile = None ):
-        if commandFile is not None:
-            self._cmdExprsByFile.setdefault( commandFile, [] )
-            self._qmStartEventsByFile.setdefault( commandFile, [] )
-
-        for info in commandInfoList:
-            if hasattr( info["func"], "on_quasimode_start" ):
-                handler = info["func"].on_quasimode_start
-                self._qmStartEvents.append( handler )
-                if commandFile is not None:
-                    self._qmStartEventsByFile[commandFile].append( handler )
-            cmd = adapters.makeCommandFromInfo(
-                info,
-                ensoapi.EnsoApi(),
-                self._genMgr
-                )
-            self._registerCommand( cmd, info["cmdExpr"], commandFile )
+def normalizePath(path):
+    return os.path.normcase(
+        os.path.realpath(
+            os.path.abspath(path)
+        )
+    )
 
 
-class ScriptTracker:
-    def __init__( self, eventManager, commandManager ):
-        self._scriptCmdTracker = ScriptCommandTracker( commandManager,
-                                                       eventManager )
+def _getFileSignature(path):
+    stat = os.stat(path)
+    mtime_ns = getattr(stat, "st_mtime_ns", None)
+    if mtime_ns is None:
+        mtime_ns = int(stat.st_mtime * 1000000000)
+    return (mtime_ns, stat.st_size)
+
+
+class ScriptConflictError(Exception):
+    pass
+
+
+class LoadedScript(object):
+    def __init__(self, path):
+        self.path = normalizePath(path)
+        self.commands = []
+        self.commandExprs = []
+        self.handlers = []
+        self.dependencies = []
+        self.fingerprint = None
+        self.globals = {}
+        self.status = "loaded"
+        self.lastError = None
+        self.failedFingerprint = None
+
+
+class ScriptTracker(object):
+    def __init__(self, eventManager, commandManager):
         from enso.providers import getInterface
+
+        self._cmdMgr = commandManager
+        self._genMgr = concurrency.GeneratorManager(eventManager)
         self._scriptFolder = getInterface("scripts_folder")()
-        self._lastMods = {}
-        self._scriptDependencies = {}
-        self._fileDependencies = []
-        self._registerDependencies()
-        self._pendingChanges = False
+        self._loadedScripts = {}
+        self._dependentsByFile = {}
+        self._lastSignatures = {}
+        self._failedScripts = {}
+        self._pendingLock = threading.Lock()
         self._pendingFiles = set()
+        self._fullScanPending = False
 
-        eventManager.registerResponder(
-            self._updateScripts,
-            "startQuasimode"
-            )
+        eventManager.registerResponder(self._updateScripts, "startQuasimode")
+        eventManager.registerResponder(self._onQuasimodeStart, "startQuasimode")
 
-        commandManager.registerCommand( TracebackCommand.NAME,
-                                        TracebackCommand() )
+        commandManager.registerCommand(TracebackCommand.NAME, TracebackCommand())
         self._updateScripts(True)
 
     @classmethod
-    def install( cls, eventManager, commandManager ):
-        cls._instance = cls( eventManager, commandManager )
+    def install(cls, eventManager, commandManager):
+        cls._instance = cls(eventManager, commandManager)
 
     @classmethod
-    def get( cls ):
+    def get(cls):
         return cls._instance
 
-    def setPendingChanges( self, fileName = None ):
-        self._pendingChanges = True
-        if fileName is not None:
-            self._pendingFiles.add( os.path.abspath( fileName ) )
+    def setPendingChanges(self, fileName=None):
+        with self._pendingLock:
+            if fileName is None:
+                self._fullScanPending = True
+            else:
+                self._pendingFiles.add(normalizePath(fileName))
+
+    def _drainPendingChanges(self):
+        with self._pendingLock:
+            files = set(self._pendingFiles)
+            fullScan = self._fullScanPending
+            self._pendingFiles.clear()
+            self._fullScanPending = False
+        return files, fullScan
+
+    def clearCommands(self):
+        for script in list(self._loadedScripts.values()):
+            self._detachScriptCommands(script)
+        self._loadedScripts = {}
+        self._dependentsByFile = {}
+        self._lastSignatures = {}
+        self._failedScripts = {}
+        self._genMgr.reset()
 
     @safetyNetted
-    def _getGlobalsFromSourceCode( self, text, filename ):
+    def _callHandler(self, handler, owner):
+        result = handler()
+        if isinstance(result, types.GeneratorType):
+            self._genMgr.add(result, owner)
+
+    def _onQuasimodeStart(self):
+        for scriptPath in sorted(self._loadedScripts.keys(), key=str.lower):
+            script = self._loadedScripts[scriptPath]
+            for handler in script.handlers:
+                self._callHandler(handler, script.path)
+
+    @safetyNetted
+    def _getGlobalsFromSourceCode(self, text, filename):
         allGlobals = {}
-        code = compile( text, filename, "exec" )
+        code = compile(text, filename, "exec")
         try:
             exec(code, allGlobals)
-        except Exception as e:
-            print(traceback.format_exc())
-            raise e
-
+        except Exception:
+            logging.exception("Failed executing %s", filename)
+            raise
         return allGlobals
 
-    def _getCommandFiles( self ):
+    def _getCommandFiles(self):
         commandFiles = []
-        try:
-            commandFiles = [
-              os.path.abspath( os.path.join(self._scriptFolder, x) )
-              for x in os.listdir(self._scriptFolder)
-              if x.endswith(".py")
-            ]
-        except Exception:
-            pass
+        folders = [
+            self._scriptFolder,
+            os.path.join(config.ENSO_USER_DIR, "commands"),
+        ]
 
-        try:
-            userScriptFolder = os.path.join(config.ENSO_USER_DIR, "commands")
-            commandFiles = commandFiles + [
-                os.path.abspath( os.path.join(userScriptFolder, x) )
-                for x in os.listdir(userScriptFolder)
-                if x.endswith(".py")
-            ]
-        except Exception:
-            pass
-
-        # Keep the filesystem order while avoiding loading the same absolute
-        # path twice when both script providers point at one folder.
-        uniqueFiles = []
-        seenFiles = set()
-        for fileName in commandFiles:
-            if fileName not in seenFiles:
-                uniqueFiles.append( fileName )
-                seenFiles.add( fileName )
-
-        return uniqueFiles
-
-    def _reloadPyScripts( self, commandFiles = None ):
-        if commandFiles is None:
-            commandFiles = self._getCommandFiles()
-
-        print(commandFiles)
-
-        for f in commandFiles:
-            if not os.path.exists( f ):
-                self._scriptCmdTracker.clearCommands( f )
-                self._scriptDependencies.pop( f, None )
-                continue
-
+        for folder in folders:
             try:
-                text = open( f, "r" ).read()
-            except Exception:
+                fileNames = sorted(os.listdir(folder), key=str.lower)
+            except OSError as error:
+                logging.warning(
+                    "Unable to enumerate Scriptotron folder %s: %s",
+                    folder,
+                    error,
+                )
                 continue
 
-            allGlobals = self._getGlobalsFromSourceCode(text, f)
+            for fileName in fileNames:
+                if fileName.endswith(".py"):
+                    commandFiles.append(
+                        normalizePath(os.path.join(folder, fileName))
+                    )
 
-            # Keep the last working commands registered when the edited file
-            # contains a temporary syntax/runtime error.
-            if allGlobals is None:
-                continue
+        return commandFiles
 
-            category = os.path.splitext(os.path.basename(f))[0].replace("_", " ")
-
-            if "CATEGORY" in allGlobals:
-                category = allGlobals["CATEGORY"]
-
-            for fn in allGlobals:
-                if callable(allGlobals[fn]) \
-                        and fn.startswith(cmdretriever.SCRIPT_PREFIX):
-                    allGlobals[fn].category = category
-                    allGlobals[fn].cmdFile = f
-
-            infos = cmdretriever.getCommandsFromObjects( allGlobals )
-
-            # Replace only commands and quasimode handlers owned by this file.
-            self._scriptCmdTracker.clearCommands( f )
-            self._scriptCmdTracker.registerNewCommands( infos, f )
-            self._registerDependencies( allGlobals, f )
-
-        self._refreshFileDependencies()
-
-    def _getExtraDependencies( self, allGlobals, commandFile ):
-        extraDeps = []
+    def _collectDependencies(self, path, allGlobals):
+        dependencies = set([normalizePath(path)])
 
         for obj in list(allGlobals.values()):
-            code = getattr( obj, "__code__", None )
+            code = getattr(obj, "__code__", None)
             if code is None:
-                code = getattr( obj, "func_code", None )
+                continue
+            if getattr(obj, "__module__", None) is None:
+                dependencies.add(normalizePath(code.co_filename))
 
-            if code is not None and getattr(obj, "__module__", None) is None:
-                fileName = os.path.abspath( code.co_filename )
-                if fileName != commandFile:
-                    extraDeps.append( fileName )
+        return sorted(dependencies, key=str.lower)
 
-        return extraDeps
+    def _prepareScript(self, fileName):
+        path = normalizePath(fileName)
 
-    def _registerDependencies( self, allGlobals = None, commandFile = None ):
-        baseDeps = self._getCommandFiles()
+        with tokenize.open(path) as sourceFile:
+            text = sourceFile.read()
 
-        if commandFile is not None and allGlobals is not None:
-            commandFile = os.path.abspath( commandFile )
-            extraDeps = self._getExtraDependencies( allGlobals, commandFile )
-            self._scriptDependencies[commandFile] = set(
-                [commandFile] + extraDeps
+        allGlobals = self._getGlobalsFromSourceCode(text, path)
+        candidate = LoadedScript(path)
+        candidate.globals = allGlobals
+        candidate.fingerprint = _getFileSignature(path)
+
+        category = os.path.splitext(os.path.basename(path))[0].replace("_", " ")
+        if "CATEGORY" in allGlobals:
+            category = allGlobals["CATEGORY"]
+
+        for name, value in allGlobals.items():
+            if callable(value) and name.startswith(cmdretriever.SCRIPT_PREFIX):
+                value.category = category
+                value.cmdFile = path
+
+        infos = cmdretriever.getCommandsFromObjects(allGlobals)
+        for info in infos:
+            command = adapters.makeCommandFromInfo(
+                info,
+                ensoapi.EnsoApi(),
+                self._genMgr,
+                commandFile=path,
+            )
+            candidate.commands.append((info["cmdExpr"], command))
+            if hasattr(info["func"], "on_quasimode_start"):
+                candidate.handlers.append(info["func"].on_quasimode_start)
+
+        candidate.commandExprs = [expr for expr, _ in candidate.commands]
+        candidate.dependencies = self._collectDependencies(path, allGlobals)
+        return candidate
+
+    def _validateCandidate(self, candidate, oldScript):
+        existing = self._cmdMgr.getCommands()
+        ownedByOldScript = set(oldScript.commandExprs if oldScript else [])
+        seen = set()
+
+        for commandExpr in candidate.commandExprs:
+            if commandExpr in seen:
+                raise ScriptConflictError(
+                    "Command declared twice in %s: %s"
+                    % (candidate.path, commandExpr)
                 )
-        else:
-            for fileName in baseDeps:
-                self._scriptDependencies.setdefault( fileName, set([fileName]) )
 
-        self._refreshFileDependencies()
+            if commandExpr in existing and commandExpr not in ownedByOldScript:
+                raise ScriptConflictError(
+                    "Command '%s' is already provided by another script."
+                    % commandExpr
+                )
 
-    def _refreshFileDependencies( self ):
-        dependencies = set( self._getCommandFiles() )
-        for scriptDependencies in self._scriptDependencies.values():
-            dependencies.update( scriptDependencies )
-        self._fileDependencies = list( dependencies )
+            seen.add(commandExpr)
 
-    def _getModificationTime( self, fileName ):
+    def _detachScriptCommands(self, script):
+        if script is None:
+            return
+
+        for commandExpr in reversed(script.commandExprs):
+            try:
+                self._cmdMgr.unregisterCommand(commandExpr)
+            except Exception as error:
+                logging.warning(
+                    "Unable to unregister %s from %s: %s",
+                    commandExpr,
+                    script.path,
+                    error,
+                )
+
+        self._genMgr.reset(script.path)
+
+    def _attachScriptCommands(self, script):
+        registered = []
+
         try:
-            return os.stat( fileName ).st_mtime
-        except OSError:
-            return None
+            for commandExpr, command in script.commands:
+                self._cmdMgr.registerCommand(commandExpr, command)
+                registered.append(commandExpr)
+        except Exception:
+            for commandExpr in reversed(registered):
+                try:
+                    self._cmdMgr.unregisterCommand(commandExpr)
+                except Exception:
+                    logging.exception(
+                        "Rollback failed while detaching %s from %s",
+                        commandExpr,
+                        script.path,
+                    )
+            raise
 
-    def _getChangedFiles( self, commandFiles ):
-        dependencies = set( self._fileDependencies )
-        dependencies.update( commandFiles )
-        changedFiles = set()
-        notSeen = object()
+        script.commandExprs = registered
 
-        for fileName in dependencies:
-            lastMod = self._getModificationTime( fileName )
-            if lastMod != self._lastMods.get(fileName, notSeen):
-                changedFiles.add( fileName )
+    def _removeDependencyIndexForScript(self, script):
+        for dependency in script.dependencies:
+            dependents = self._dependentsByFile.get(dependency)
+            if not dependents:
+                continue
+            dependents.discard(script.path)
+            if not dependents:
+                del self._dependentsByFile[dependency]
 
-        return changedFiles
+    def _addDependencyIndexForScript(self, script):
+        for dependency in script.dependencies:
+            self._dependentsByFile.setdefault(dependency, set()).add(script.path)
 
-    def _getAffectedScripts( self, changedFiles, commandFiles ):
-        commandFiles = set( commandFiles )
-        knownScripts = set( self._scriptDependencies )
-        affectedScripts = set()
+    def _recordLoadedScript(self, script):
+        self._loadedScripts[script.path] = script
+        self._addDependencyIndexForScript(script)
+        self._lastSignatures[script.path] = script.fingerprint
+        for dependency in script.dependencies:
+            if os.path.exists(dependency):
+                self._lastSignatures[dependency] = _getFileSignature(dependency)
+        self._failedScripts.pop(script.path, None)
 
-        # New and deleted command files need loading or unregistering even if
-        # they have no dependency record yet.
-        affectedScripts.update( commandFiles - knownScripts )
-        affectedScripts.update( knownScripts - commandFiles )
+    def _recordFailure(self, fileName, error, candidate=None, oldScript=None):
+        path = normalizePath(fileName)
+        failedScript = candidate or LoadedScript(path)
+        failedScript.status = "error"
+        failedScript.lastError = traceback.format_exc()
+        if candidate is not None:
+            failedScript.failedFingerprint = candidate.fingerprint
+        self._failedScripts[path] = failedScript
 
-        for fileName in changedFiles:
-            if fileName in commandFiles or fileName in knownScripts:
-                affectedScripts.add( fileName )
+        if oldScript is not None:
+            logging.warning(
+                "Could not reload %s. The previous working version is still active.",
+                path,
+            )
+        else:
+            logging.warning("Could not load %s.", path)
 
-            for scriptFile, dependencies in self._scriptDependencies.items():
-                if fileName in dependencies:
-                    affectedScripts.add( scriptFile )
+        logging.debug("Reload failure for %s: %s", path, error, exc_info=True)
 
-        return affectedScripts
+    def _reloadScript(self, fileName):
+        path = normalizePath(fileName)
+        oldScript = self._loadedScripts.get(path)
+        currentSignature = None
+        if os.path.exists(path):
+            currentSignature = _getFileSignature(path)
 
-    def _rememberModificationTimes( self ):
-        self._refreshFileDependencies()
-        self._lastMods = {
-            fileName: self._getModificationTime( fileName )
-            for fileName in self._fileDependencies
-            }
+        failedScript = self._failedScripts.get(path)
+        if failedScript is not None and failedScript.failedFingerprint == currentSignature:
+            logging.debug("Skipping unchanged failed version of %s", path)
+            return False
 
-    def _updateScripts( self, init=False):
-        commandFiles = self._getCommandFiles()
-        scriptsToReload = []
-        checkedForChanges = False
+        oldDetached = False
+        candidate = None
 
-        if init:
-            scriptsToReload = commandFiles
-            checkedForChanges = True
-        elif config.TRACK_COMMAND_CHANGES or self._pendingChanges:
-            checkedForChanges = True
-            changedFiles = self._getChangedFiles( commandFiles )
-            changedFiles.update( self._pendingFiles )
-            affectedScripts = self._getAffectedScripts(
-                changedFiles,
-                commandFiles
-                )
+        try:
+            candidate = self._prepareScript(path)
+            self._validateCandidate(candidate, oldScript)
 
-            # Preserve command-file order so duplicate command handling remains
-            # deterministic.  Deleted files are appended for cleanup.
-            scriptsToReload = [
-                fileName for fileName in commandFiles
-                if fileName in affectedScripts
-                ]
-            scriptsToReload.extend(
-                fileName for fileName in affectedScripts
-                if fileName not in commandFiles
-                )
+            if oldScript is not None:
+                self._detachScriptCommands(oldScript)
+                oldDetached = True
 
-        self._pendingChanges = False
-        self._pendingFiles.clear()
+            self._attachScriptCommands(candidate)
+        except Exception as error:
+            if oldDetached and oldScript is not None:
+                try:
+                    self._attachScriptCommands(oldScript)
+                except Exception:
+                    logging.exception(
+                        "Unable to restore the previous version of %s after a failed reload.",
+                        path,
+                    )
+                    raise
 
-        if scriptsToReload:
-            self._reloadPyScripts( scriptsToReload )
+            self._recordFailure(path, error, candidate, oldScript)
+            return False
 
-        if checkedForChanges:
-            self._rememberModificationTimes()
+        if oldScript is not None:
+            self._removeDependencyIndexForScript(oldScript)
+
+        self._recordLoadedScript(candidate)
+        candidate.status = "loaded"
+        candidate.lastError = None
+        candidate.failedFingerprint = None
+        logging.info("Reloaded %s", path)
+        return True
+
+    def _unloadScript(self, fileName):
+        path = normalizePath(fileName)
+        oldScript = self._loadedScripts.pop(path, None)
+        if oldScript is None:
+            return False
+
+        self._detachScriptCommands(oldScript)
+        self._removeDependencyIndexForScript(oldScript)
+        self._lastSignatures.pop(path, None)
+        self._failedScripts.pop(path, None)
+        logging.info("Unloaded %s", path)
+        return True
+
+    def _expandAffectedScripts(self, changedFiles):
+        affected = set(changedFiles)
+        pending = list(changedFiles)
+
+        while pending:
+            current = pending.pop()
+            for dependent in self._dependentsByFile.get(current, ()):
+                if dependent not in affected:
+                    affected.add(dependent)
+                    pending.append(dependent)
+
+        return affected
+
+    def _updateScripts(self, init=False):
+        pendingFiles, fullScanPending = self._drainPendingChanges()
+        currentFiles = set(self._getCommandFiles())
+        changedFiles = set(pendingFiles)
+
+        if init or config.TRACK_COMMAND_CHANGES or fullScanPending:
+            watchedFiles = set(self._lastSignatures.keys()) | currentFiles
+
+            for fileName in watchedFiles:
+                if os.path.exists(fileName):
+                    signature = _getFileSignature(fileName)
+                    if signature != self._lastSignatures.get(fileName):
+                        changedFiles.add(fileName)
+                elif fileName in self._lastSignatures:
+                    changedFiles.add(fileName)
+
+            for fileName in currentFiles:
+                if fileName not in self._lastSignatures:
+                    changedFiles.add(fileName)
+
+            for fileName in list(self._loadedScripts.keys()):
+                if fileName not in currentFiles:
+                    changedFiles.add(fileName)
+
+        affectedScripts = self._expandAffectedScripts(changedFiles)
+
+        for fileName in sorted(affectedScripts, key=str.lower):
+            if os.path.exists(fileName):
+                self._reloadScript(fileName)
+            else:
+                self._unloadScript(fileName)
+

@@ -9,10 +9,12 @@ ARG_REQUIRED_MSG = "An argument is required."
 
 class FuncCommand( CommandObject ):
     def __init__( self, cmdName, func, desc, help, ensoapi, 
-                  generatorManager, takesArg = False, argValue = None ):
+                  generatorManager, takesArg = False, argValue = None,
+                  commandFile = None ):
         CommandObject.__init__( self )
 
         self.name = cmdName
+        self.cmdExpr = cmdName
 
         # added to unify command name retrieval
         self.cmdName = cmdName
@@ -22,6 +24,8 @@ class FuncCommand( CommandObject ):
         self.argValue = argValue
         self.ensoapi = ensoapi
         self.generatorManager = generatorManager
+        self.commandFile = commandFile
+        self.cmdFile = commandFile
 
         self.setName( cmdName )
         self.setHelp( help )
@@ -35,7 +39,7 @@ class FuncCommand( CommandObject ):
             result = self.func(self.ensoapi)
 
         if isinstance( result, types.GeneratorType ):
-            self.generatorManager.add( result )
+            self.generatorManager.add( result, self.commandFile )
 
 class NoArgumentCommand( CommandObject ):
     def __init__( self, description, message, ensoapi ):
@@ -49,13 +53,16 @@ class NoArgumentCommand( CommandObject ):
 
 class ArgFuncMixin( object ):
     def __init__( self, cmdName, cmdExpr, func, argName, desc,
-                  help, ensoapi, generatorManager, isArgRequired ):
+                  help, ensoapi, generatorManager, isArgRequired,
+                  commandFile = None ):
         self.cmdName = cmdName
+        self.cmdExpr = cmdExpr
         self.func = func
         self.desc = desc
         self.isArgRequired = isArgRequired
         self.ensoapi = ensoapi
         self.generatorManager = generatorManager
+        self.commandFile = commandFile
 
         self.HELP_TEXT = argName
         self.NAME = cmdExpr
@@ -82,7 +89,8 @@ class ArgFuncMixin( object ):
                 ensoapi = self.ensoapi,
                 generatorManager = self.generatorManager,
                 takesArg = bool(postfix),
-                argValue = postfix
+                argValue = postfix,
+                commandFile = self.commandFile
                 )
 
 class ArbitraryArgFuncCommand( ArbitraryPostfixFactory, ArgFuncMixin ):
@@ -103,7 +111,7 @@ class BoundedArgFuncCommand( GenericPrefixFactory, ArgFuncMixin ):
 
     _generateCommandObj = ArgFuncMixin._generateCommandObj
 
-def makeCommandFromInfo( info, ensoapi, generatorManager ):
+def makeCommandFromInfo( info, ensoapi, generatorManager, commandFile = None ):
     if info["cmdType"] == "no-arg":
         return FuncCommand(
             info["cmdName"],
@@ -111,7 +119,8 @@ def makeCommandFromInfo( info, ensoapi, generatorManager ):
             info["desc"],
             info["help"],
             ensoapi,
-            generatorManager
+            generatorManager,
+            commandFile = commandFile
             )
     elif info["cmdType"] in ["bounded-arg", "arbitrary-arg"]:
         if info["cmdType"] == "bounded-arg":
@@ -127,7 +136,8 @@ def makeCommandFromInfo( info, ensoapi, generatorManager ):
             info["help"],
             ensoapi,
             generatorManager,
-            info["isArgRequired"]
+            info["isArgRequired"],
+            commandFile = commandFile
             )
     else:
         raise ValueError( "Unknown command type: %s" % info["cmdType"] )

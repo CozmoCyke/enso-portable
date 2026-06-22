@@ -1,3 +1,5 @@
+import threading
+
 from enso.contrib.scriptotron.tracebacks import safetyNetted
 from enso.contrib.scriptotron.events import EventResponderList
 
@@ -14,23 +16,37 @@ class GeneratorManager( object ):
             "timer",
             self.__onTimer
             )
+        self.__lock = threading.Lock()
 
     @safetyNetted
-    def __callGenerator( self, generator, keepAlives ):
+    def __callGenerator( self, owner, generator, keepAlives ):
         try:
             next(generator)
-            keepAlives.append( generator )
+            keepAlives.append( (owner, generator) )
         except StopIteration:
             pass
 
     def __onTimer( self, msPassed ):
+        with self.__lock:
+            generators = list(self.__generators)
+
         keepAlives = []
-        for generator in self.__generators:
-            self.__callGenerator( generator, keepAlives )
-        self.__generators[:] = keepAlives
+        for owner, generator in generators:
+            self.__callGenerator( owner, generator, keepAlives )
 
-    def reset( self ):
-        self.__generators[:] = []
+        with self.__lock:
+            self.__generators[:] = keepAlives
 
-    def add( self, generator ):
-        self.__generators.append( generator )
+    def reset( self, owner = None ):
+        with self.__lock:
+            if owner is None:
+                self.__generators[:] = []
+            else:
+                self.__generators[:] = [
+                    item for item in self.__generators
+                    if item[0] != owner
+                ]
+
+    def add( self, generator, owner = None ):
+        with self.__lock:
+            self.__generators.append( (owner, generator) )
